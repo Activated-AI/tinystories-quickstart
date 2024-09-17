@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+logs/
+*.pt
+*.pth
+dataset/
 
 # C extensions
 *.so
