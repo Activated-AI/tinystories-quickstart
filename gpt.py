@@ -6,25 +6,30 @@ from dataclasses import dataclass, fields
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import datasets
 import tokenizers
+import transformers  # for AutoTokenizer, using our own transformer implementation.
+from tqdm import tqdm
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256 # max sequence length     
-    n_layer: int = 12 # number of layers    
+    block_size: int = 512 # max sequence length     
+    n_layer: int = 16 # number of layers    
     n_head: int = 16 # number of heads       
     n_embd: int = 512 # embedding dimension 
     vocab_size: int = 8192
     batch_size: int = 128    
-    data_dir: str = 'tiny-stories-8k-eos'    
-    expt_name: str = '12l_16h_512d_8k_vocab_2e3_lr_good_max_eos'
+    data_dir: str = 'dataset'    
+    expt_name: str = '16l_16h_512d_quick'
     max_lr: float = 2e-3
     min_lr: float = 2e-4
     beta_1: float = 0.9
     beta_2: float = 0.99
-    warmup_steps:int = 200
-    max_steps: int = 8000
-    weight_decay: float = 0.13
+    warmup_steps: int = 50
+    max_steps: int = 500
+    #warmup_steps:int = 500
+    #max_steps: int = 60000
+    weight_decay: float = 0.15
     feed_forward_factor: int = 2  # how much bigger the MLP blocks are than the model n_embd
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
@@ -212,8 +217,8 @@ class DataLoaderLite:
 def generate(model, enc, prompt, max_length, num_return_sequences):
     model.eval() 
     
-    eos_id = enc.token_to_id('[EOS]')
-    tokens = enc.encode(prompt).ids
+    eos_id = enc.get_vocab()['[EOS]']
+    tokens = enc.encode(prompt)
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
     xgen = tokens.to('cuda')
@@ -252,6 +257,26 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
     model.train()
 
 
+def preprocess_tokens_from_huggingface(dataset_dir):
+    def flatten_tensorize_dataset_split(it):
+        num_docs = len(it)
+        flattened_tokens = []
+        for doc in tqdm(it, desc='flattening', total=num_docs):
+            flattened_tokens.extend(doc)
+        return torch.tensor(flattened_tokens, dtype=torch.int16)
+
+    for split in ['validation', 'train']:
+        os.makedirs(dataset_dir, exist_ok=True)
+        fn = f'{dataset_dir}/{split}.pt'
+        if not os.path.exists(fn):         
+            print('downloading and processing', split)
+            ds = datasets.load_dataset('activated-ai/tiny-stories-8k-tokens', split=split)
+            val_tensor = flatten_tensorize_dataset_split(ds['tokens'])
+            torch.save(val_tensor, fn)
+        else:
+            print('skipping token preprocessing for', split, ' : using cache', fn)
+
+
 def main():
     config = GPTConfig()
     assert torch.cuda.is_available()
@@ -262,13 +287,15 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    enc = tokenizers.ByteLevelBPETokenizer(f'{config.data_dir}/tokenizer-vocab.json', f'{config.data_dir}/tokenizer-merges.txt')
+    enc = transformers.AutoTokenizer.from_pretrained('activated-ai/tiny-stories-8k-tokenizer')
 
-    val_loader = DataLoaderLite(data_dir=config.data_dir, B=config.batch_size, T=config.block_size, split="val")
+    preprocess_tokens_from_huggingface(config.data_dir)
+
+    val_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="val")
     bytes_in_val_text = 19190318 
     bytes_per_token = bytes_in_val_text / val_loader.tokens.shape[0]
     if not config.smoke_test:
-        train_loader = DataLoaderLite(data_dir=config.data_dir, B=config.batch_size, T=config.block_size, split="train")        
+        train_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="train")        
     else:    
         train_loader = val_loader
 
@@ -390,7 +417,7 @@ def main():
             avg_loss = sum(loss_accum) / len(loss_accum)
             loss_accum.clear()
 
-            if ds > 600:
+            if ds > 6000:
                 print('exiting due to time limit')
                 last_step = True                
 
