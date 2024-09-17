@@ -17,20 +17,23 @@ class GPTConfig:
     n_layer: int = 16 # number of layers    
     n_head: int = 16 # number of heads       
     n_embd: int = 512 # embedding dimension 
+    feed_forward_factor: int = 2  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
     vocab_size: int = 8192
-    batch_size: int = 128    
+    
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_quick'
+    expt_name: str = '16l_16h_512d_hour'
+
+    batch_size: int = 128    
     max_lr: float = 2e-3
     min_lr: float = 2e-4
     beta_1: float = 0.9
-    beta_2: float = 0.99
-    warmup_steps: int = 50
-    max_steps: int = 500
-    #warmup_steps:int = 500
-    #max_steps: int = 60000
-    weight_decay: float = 0.15
-    feed_forward_factor: int = 2  # how much bigger the MLP blocks are than the model n_embd
+    beta_2: float = 0.99    
+    warmup_steps:int = 500
+    max_steps: int = 50000
+    max_runtime_seconds: int = 3600
+
+    weight_decay: float = 0.15    
+    
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
     smoke_test: bool = False 
@@ -254,6 +257,7 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
         tokens = xgen[i, :this_end].tolist()
         decoded = enc.decode(tokens)
         print(f"sample {i}: {decoded}")
+
     model.train()
 
 
@@ -385,12 +389,7 @@ def main():
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
-
-            if last_step:
-                generate(model, enc, "Lily and her mom went to a park", 256, 4)
-                break
         
-        # do one step of the optimization
         model.train()
         optimizer.zero_grad()
         
@@ -417,7 +416,7 @@ def main():
             avg_loss = sum(loss_accum) / len(loss_accum)
             loss_accum.clear()
 
-            if ds > 6000:
+            if ds > config.max_runtime_seconds:
                 print('exiting due to time limit')
                 last_step = True                
 
