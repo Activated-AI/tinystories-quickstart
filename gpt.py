@@ -35,6 +35,7 @@ class GPTConfig:
     weight_decay: float = 0.15    
 
     need_epoch_reshuffle: bool = False  # Fix this.
+    matmul_precision: str = 'medium' # higher, highest.  have not experimented with yet
     
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
@@ -298,7 +299,7 @@ def main():
     preprocess_tokens_from_huggingface(config.data_dir)
 
     val_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="val")
-    bytes_in_val_text = 19190318 
+    bytes_in_val_text = 19190318  # compute this on data load by using tokenizer on say, first 100k tokens in validation data.
     bytes_per_token = bytes_in_val_text / val_loader.tokens.shape[0]
     if not config.smoke_test:
         train_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="train")        
@@ -307,7 +308,7 @@ def main():
 
     model = GPT(config)
 
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision(config.matmul_precision)
 
     model.to(device)
     use_compile = not config.smoke_test
@@ -315,6 +316,7 @@ def main():
         print('using torch.compile')
         model = torch.compile(model)
             
+    # TODO: replace this with torch LR built in scheduler.
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
         if it < config.warmup_steps:
@@ -388,8 +390,7 @@ def main():
                     'step': step,
                     'val_loss': val_loss_accum.item()
                 }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
+                # Store rng seeds too?
                 
                 # if last step, save the optimzer state dict
                 if eval_checkpoint_exit:
