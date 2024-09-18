@@ -1,5 +1,6 @@
 import os
 import math
+import random
 import time
 import inspect
 from dataclasses import dataclass, fields
@@ -21,21 +22,21 @@ class GPTConfig:
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_8_hour_good_max'
+    expt_name: str = '16l_16h_512d_3_hour_good_max_hig_prec'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
     min_lr: float = 1e-4
     beta_1: float = 0.9
     beta_2: float = 0.99    
-    warmup_steps:int = 5000
-    max_steps: int =  32000 * 8
-    max_runtime_seconds: int = 3600 * 8
+    warmup_steps:int = 500
+    max_steps: int = 20000 * 3
+    max_runtime_seconds: int = 3600 * 3
 
-    weight_decay: float = 0.15    
+    weight_decay: float = 0.13    
 
-    need_epoch_reshuffle: bool = False  # Fix this.
-    matmul_precision: str = 'medium' # higher, highest.  have not experimented with yet
+    need_epoch_reshuffle: bool = True
+    matmul_precision: str = 'high' # medium, high, highest.  have not experimented with yet
     
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
@@ -184,9 +185,8 @@ def load_tokens(filename):
     
 
 class DataLoaderLite:
-    def __init__(self, data_dir, B, T, split):
-        self.B = B
-        self.T = T
+    def __init__(self, data_dir, B, T, split, shuffle):
+        self.B, self.T, self.shuffle = B, T, shuffle        
         assert split in {'train', 'val'}
         
         shards = os.listdir(data_dir)
@@ -197,13 +197,42 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
     
         print(f"found {len(shards)} shards for split {split}")
+        
         self.reset()
 
     def reset(self):
-        # state, init at shard zero
-        self.current_shard = 0
+        self.current_shard, self.current_position = 0, 0
         self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T
+        if self.shuffle:
+            start = time.time()
+            self.shuffle_tokens()
+            print(f"shuffled tokens in {time.time() - start:.1f}s")
+
+    def shuffle_tokens(self, DOCUMENT_END: int = 0):
+        """Shuffle documents in a flat token tensor while keeping each document contiguous."""
+        end_indices = (self.tokens == DOCUMENT_END).nonzero(as_tuple=False).flatten().tolist()
+
+        # If the last token is not DOCUMENT_END, consider it as an incomplete document
+        if not end_indices or end_indices[-1] != len(self.tokens) - 1:
+            end_indices.append(len(self.tokens) - 1)
+
+        # Initialize list to hold document slices
+        documents = []
+        prev_end = -1  # Start before the first token
+
+        for end in end_indices:
+            # Slice from the token after the previous DOCUMENT_END to the current DOCUMENT_END
+            # +1 to include the DOCUMENT_END token in the document
+            doc = self.tokens[prev_end + 1 : end + 1]
+            documents.append(doc)
+            prev_end = end
+
+        # Shuffle the list of documents
+        random.shuffle(documents)
+
+        # Concatenate the shuffled documents back into a single tensor
+        self.tokens = torch.cat(documents, dim=0)
+            
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -298,11 +327,11 @@ def main():
 
     preprocess_tokens_from_huggingface(config.data_dir)
 
-    val_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="val")
+    val_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="val", shuffle=False)
     bytes_in_val_text = 19190318  # compute this on data load by using tokenizer on say, first 100k tokens in validation data.
     bytes_per_token = bytes_in_val_text / val_loader.tokens.shape[0]
     if not config.smoke_test:
-        train_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="train")        
+        train_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="train", shuffle=config.need_epoch_reshuffle)        
     else:    
         train_loader = val_loader
 
