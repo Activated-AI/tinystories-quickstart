@@ -21,7 +21,7 @@ class GPTConfig:
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_hour'
+    expt_name: str = '16l_16h_512d_hour_good_max'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
@@ -29,10 +29,10 @@ class GPTConfig:
     beta_1: float = 0.9
     beta_2: float = 0.99    
     warmup_steps:int = 500
-    max_steps: int = 50000
+    max_steps: int = 32000
     max_runtime_seconds: int = 3600
 
-    weight_decay: float = 0.15    
+    weight_decay: float = 0.13    
     
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
@@ -389,6 +389,10 @@ def main():
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
+
+            if last_step:
+                break
+        
         
         model.train()
         optimizer.zero_grad()
@@ -415,7 +419,6 @@ def main():
             tokens_per_sec = tokens_processed / dt
             avg_loss = sum(loss_accum) / len(loss_accum)
             loss_accum.clear()
-
             if ds > config.max_runtime_seconds:
                 print('exiting due to time limit')
                 last_step = True                
@@ -423,6 +426,6 @@ def main():
             per_byte_loss = avg_loss / bytes_per_token
             log_msg(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
             
-
+            
 if __name__ == "__main__":
     main()
