@@ -22,22 +22,21 @@ class GPTConfig:
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_3_hour_good_max_hig_prec'
+    expt_name: str = '16l_16h_512d_3_hour_good_max_med_prec_fixed_shuffle'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
-    min_lr: float = 1e-4
+    min_lr: float = 5e-5
     beta_1: float = 0.9
     beta_2: float = 0.99    
     warmup_steps:int = 500
-    max_steps: int = 20000 * 3
+    max_steps: int = 30000 * 3
     max_runtime_seconds: int = 3600 * 3
 
-    weight_decay: float = 0.13    
+    weight_decay: float = 0.13
 
     need_epoch_reshuffle: bool = True
-    matmul_precision: str = 'high' # medium, high, highest.  have not experimented with yet
-    
+    matmul_precision: str = 'medium' # medium, high, highest.  
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
     smoke_test: bool = False 
@@ -198,15 +197,16 @@ class DataLoaderLite:
     
         print(f"found {len(shards)} shards for split {split}")
         
+        self.current_shard, self.current_position = -1, 0
         self.reset()
 
     def reset(self):
-        self.current_shard, self.current_position = 0, 0
+        self.current_shard, self.current_position = (self.current_shard + 1) % len(self.shards), 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         if self.shuffle:
             start = time.time()
             self.shuffle_tokens()
-            print(f"shuffled tokens in {time.time() - start:.1f}s")
+            print(f"shuffled {self.tokens.shape[0]} tokens in {time.time() - start:.1f}s")
 
     def shuffle_tokens(self, DOCUMENT_END: int = 0):
         """Shuffle documents in a flat token tensor while keeping each document contiguous."""
@@ -215,8 +215,7 @@ class DataLoaderLite:
         # If the last token is not DOCUMENT_END, consider it as an incomplete document
         if not end_indices or end_indices[-1] != len(self.tokens) - 1:
             end_indices.append(len(self.tokens) - 1)
-
-        # Initialize list to hold document slices
+ 
         documents = []
         prev_end = -1  # Start before the first token
 
@@ -227,12 +226,8 @@ class DataLoaderLite:
             documents.append(doc)
             prev_end = end
 
-        # Shuffle the list of documents
         random.shuffle(documents)
-
-        # Concatenate the shuffled documents back into a single tensor
-        self.tokens = torch.cat(documents, dim=0)
-            
+        self.tokens = torch.cat(documents, dim=0)            
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -243,9 +238,7 @@ class DataLoaderLite:
         self.current_position += B * T 
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T 
+            self.reset()
         return x, y
 
 
@@ -327,11 +320,11 @@ def main():
 
     preprocess_tokens_from_huggingface(config.data_dir)
 
-    val_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="val", shuffle=False)
+    val_loader = DataLoaderLite(data_dir=config.data_dir, B=config.batch_size, T=config.block_size, split="val", shuffle=False)
     bytes_in_val_text = 19190318  # compute this on data load by using tokenizer on say, first 100k tokens in validation data.
     bytes_per_token = bytes_in_val_text / val_loader.tokens.shape[0]
     if not config.smoke_test:
-        train_loader = DataLoaderLite(data_dir='dataset', B=config.batch_size, T=config.block_size, split="train", shuffle=config.need_epoch_reshuffle)        
+        train_loader = DataLoaderLite(data_dir=config.data_dir , B=config.batch_size, T=config.block_size, split="train", shuffle=config.need_epoch_reshuffle)        
     else:    
         train_loader = val_loader
 
@@ -392,8 +385,6 @@ def main():
             model.eval()
             val_loader.reset()
             with torch.no_grad():
-                if eval_checkpoint_exit:
-                    val_loader.reset() # start from beginning for final eval
                 val_loss_accum = 0.0
                 val_loss_steps = 20
                 for _ in range(val_loss_steps):
@@ -449,7 +440,7 @@ def main():
 
         if step % 10 == 0:
             t1 = time.time()
-            dt = t1 - t0 # time difference in seconds
+            dt = t1 - t0 
             ds = t1 - t_start
             tokens_processed = train_loader.B * train_loader.T
             tokens_per_sec = tokens_processed / dt
