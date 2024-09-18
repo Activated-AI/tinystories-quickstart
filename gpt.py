@@ -21,18 +21,20 @@ class GPTConfig:
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_hour_good_max'
+    expt_name: str = '16l_16h_512d_8_hour_good_max'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
-    min_lr: float = 2e-4
+    min_lr: float = 1e-4
     beta_1: float = 0.9
     beta_2: float = 0.99    
-    warmup_steps:int = 500
-    max_steps: int = 32000
-    max_runtime_seconds: int = 3600
+    warmup_steps:int = 5000
+    max_steps: int =  32000 * 8
+    max_runtime_seconds: int = 3600 * 8
 
-    weight_decay: float = 0.13    
+    weight_decay: float = 0.15    
+
+    need_epoch_reshuffle: bool = False  # Fix this.
     
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
@@ -339,7 +341,7 @@ def main():
         f.write(str(config) + "\n")
 
     t_start = time.time()
-    last_step = False
+    eval_checkpoint_exit = False
     loss_accum = []
 
     def log_msg(msg):
@@ -349,17 +351,17 @@ def main():
 
     for step in range(config.max_steps):
         t0 = time.time()
-        last_step = (step == config.max_steps - 1) or last_step
+        eval_checkpoint_exit = (step == config.max_steps - 1) or eval_checkpoint_exit
 
         # once in a while evaluate our validation loss
-        if (step % 250 == 0 and step > 0) or last_step:
+        if (step % 250 == 0 and step > 0) or eval_checkpoint_exit:
             if config.smoke_test:
                 print('exiting due to smoke test')
-                last_step = True
+                eval_checkpoint_exit = True
             model.eval()
             val_loader.reset()
             with torch.no_grad():
-                if last_step:
+                if eval_checkpoint_exit:
                     val_loader.reset() # start from beginning for final eval
                 val_loss_accum = 0.0
                 val_loss_steps = 20
@@ -377,7 +379,7 @@ def main():
             
             log_msg(f'step {step} | val loss {val_loss:.4f} | byte loss {per_byte_loss:.4f} | ds {time.time() - t_start:.1f}s')            
                 
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 5000 == 0 or eval_checkpoint_exit):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -388,9 +390,13 @@ def main():
                 }
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
+                
+                # if last step, save the optimzer state dict
+                if eval_checkpoint_exit:
+                    checkpoint['optimizer'] = optimizer.state_dict()
                 torch.save(checkpoint, checkpoint_path)
 
-            if last_step:
+            if eval_checkpoint_exit:
                 break
         
         
@@ -421,11 +427,11 @@ def main():
             loss_accum.clear()
             if ds > config.max_runtime_seconds:
                 print('exiting due to time limit')
-                last_step = True                
+                eval_checkpoint_exit = True                
 
             per_byte_loss = avg_loss / bytes_per_token
             log_msg(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
             
-            
+
 if __name__ == "__main__":
     main()
