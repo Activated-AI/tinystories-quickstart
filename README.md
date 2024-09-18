@@ -28,6 +28,15 @@ After 10 minutes of training on an H100 GPU, the model completes "Lily went to t
 > 
 > As the sun began to set, Lily was sad to leave the park, but she knew she could come back again and dance with the dog again. She smiled and held on tight to the umbrella as she walked home.
 
+And then after an hour:
+
+> Lily went to the park and saw a friendly dog. She wanted to play with the dog, but the dog was big and scary. Lily was scared and didn't want to go near the dog. She ran away and found her mommy on a bench. 
+
+> "Mommy, the dog is scary," said Lily. "I don't want to play with him." 
+
+> "Don't worry, Lily," said her mommy. "The dog is friendly. Come, let's go feed the dog." 
+
+> Lily slowly approached the dog and saw that he wanted a treat. She gave the dog the treat and he wagged his tail happily. From that day on, Lily wasn't scared of dogs anymore and they became friends.
 
 ## Contributing
 
