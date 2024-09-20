@@ -15,35 +15,53 @@ from tqdm import tqdm
 @dataclass
 class GPTConfig:
     block_size: int = 512 # max sequence length     
-    n_layer: int = 16 # number of layers    
+    n_layer: int = 14 # number of layers    
     n_head: int = 16 # number of heads       
     n_embd: int = 512 # embedding dimension 
-    feed_forward_factor: int = 2  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
+    feed_forward_factor: float = 2.5  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '16l_16h_512d_3_hour_good_max_med_prec_fixed_shuffle'
+    expt_name: str = 'restart_good_3hr_search'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
-    min_lr: float = 5e-5
+    min_lr: float = 1e-4
     beta_1: float = 0.9
     beta_2: float = 0.99    
-    warmup_steps:int = 500
-    max_steps: int = 30000 * 3
-    max_runtime_seconds: int = 3600 * 3
+    warmup_steps:int = 50
+    max_steps: int = int(20000 * 3)
+    max_runtime_seconds: int = int(3600 * 3)
 
-    weight_decay: float = 0.13
+    weight_decay: float = 0.12
 
     need_epoch_reshuffle: bool = True
-    matmul_precision: str = 'medium' # medium, high, highest.  
+    matmul_precision: str = 'high' # medium, high, highest.  
     # Do various hacky things (don't use torch.compile, don't load training data) to speed up the run.  
     # # We are checking for runnability rather than model quality.
     smoke_test: bool = False 
 
     def __str__(self):
         return '\n'.join([f'{field.name}: {str(getattr(self, field.name))}' for field in fields(self)])
-        
+    
+
+class Logger():
+    def __init__(self, expt_name, smoke_test):
+        self.log_dir = f'logs/{expt_name}{"_smoke" if smoke_test else ""}'
+        os.makedirs(self.log_dir, exist_ok=True) 
+        self.log_file = f'{self.log_dir}/log.txt'
+        with open(self.log_file, "w") as f:
+            f.write("")
+
+    def log(self, msg):
+        print(msg)
+        with open(self.log_file, "a") as f:
+            f.write(f"{msg}\n")
+
+config = GPTConfig()
+logger = Logger(os.path.join(config.expt_name), config.smoke_test) # open for writing to clear the file        
+logger.log(str(config))
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -78,9 +96,11 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, config.feed_forward_factor * config.n_embd)
+        ff_exp = int(config.feed_forward_factor * config.n_embd)
+        assert ff_exp % 64 == 0
+        self.c_fc    = nn.Linear(config.n_embd, ff_exp)
         self.gelu    = nn.GELU(approximate='tanh')
-        self.c_proj  = nn.Linear(config.feed_forward_factor * config.n_embd, config.n_embd)
+        self.c_proj  = nn.Linear(ff_exp, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -169,12 +189,12 @@ class GPT(nn.Module):
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        logger.log(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        logger.log(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"    
-        print(f"using fused AdamW: {use_fused}")
+        logger.log(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(beta1, beta2), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -195,7 +215,7 @@ class DataLoaderLite:
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
     
-        print(f"found {len(shards)} shards for split {split}")
+        logger.log(f"found {len(shards)} shards for split {split}")
         
         self.current_shard, self.current_position = -1, 0
         self.reset()
@@ -206,7 +226,7 @@ class DataLoaderLite:
         if self.shuffle:
             start = time.time()
             self.shuffle_tokens()
-            print(f"shuffled {self.tokens.shape[0]} tokens in {time.time() - start:.1f}s")
+            logger.log(f"shuffled {self.tokens.shape[0]} tokens in {time.time() - start:.1f}s")
 
     def shuffle_tokens(self, DOCUMENT_END: int = 0):
         """Shuffle documents in a flat token tensor while keeping each document contiguous."""
@@ -271,7 +291,7 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
             xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
             # append to the sequence
             xgen = torch.cat((xgen, xcol), dim=1)
-    # print the generated text
+    # logger.log the generated text
     for i in range(num_return_sequences):
         # look for EOS here to truncate.
         first_eos = (xgen[i] == eos_id).nonzero()
@@ -281,7 +301,7 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
             this_end = max_length
         tokens = xgen[i, :this_end].tolist()
         decoded = enc.decode(tokens)
-        print(f"sample {i}: {decoded}")
+        logger.log(f"sample {i}: {decoded}")
 
     model.train()
 
@@ -298,16 +318,15 @@ def preprocess_tokens_from_huggingface(dataset_dir):
         os.makedirs(dataset_dir, exist_ok=True)
         fn = f'{dataset_dir}/{split}.pt'
         if not os.path.exists(fn):         
-            print('downloading and processing', split)
+            logger.log('downloading and processing', split)
             ds = datasets.load_dataset('activated-ai/tiny-stories-8k-tokens', split=split)
             val_tensor = flatten_tensorize_dataset_split(ds['tokens'])
             torch.save(val_tensor, fn)
         else:
-            print('skipping token preprocessing for', split, ' : using cache', fn)
+            logger.log(f'skipping token preprocessing for {split} : using cache {fn}')
 
 
 def main():
-    config = GPTConfig()
     assert torch.cuda.is_available()
     device = "cuda"
     device_type = "cuda"
@@ -335,7 +354,7 @@ def main():
     model.to(device)
     use_compile = not config.smoke_test
     if use_compile:
-        print('using torch.compile')
+        logger.log('using torch.compile')
         model = torch.compile(model)
             
     # TODO: replace this with torch LR built in scheduler.
@@ -359,19 +378,12 @@ def main():
     log_dir = f'logs/{config.expt_name}'
     if config.smoke_test:
         log_dir += '_smoke'
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, 'log.txt')
-    with open(log_file, "w") as f: # open for writing to clear the file
-        f.write(str(config) + "\n")
+    os.makedirs(log_dir, exist_ok=True)    
 
     t_start = time.time()
     eval_checkpoint_exit = False
     loss_accum = []
 
-    def log_msg(msg):
-        print(msg)
-        with open(log_file, "a") as f:
-            f.write(f"{msg}\n")
 
     for step in range(config.max_steps):
         t0 = time.time()
@@ -380,7 +392,7 @@ def main():
         # once in a while evaluate our validation loss
         if (step % 250 == 0 and step > 0) or eval_checkpoint_exit:
             if config.smoke_test:
-                print('exiting due to smoke test')
+                logger.log('exiting due to smoke test')
                 eval_checkpoint_exit = True
             model.eval()
             val_loader.reset()
@@ -399,7 +411,7 @@ def main():
             val_loss = val_loss_accum.item()
             per_byte_loss = val_loss / bytes_per_token
             
-            log_msg(f'step {step} | val loss {val_loss:.4f} | byte loss {per_byte_loss:.4f} | ds {time.time() - t_start:.1f}s')            
+            logger.log(f'step {step} | val loss {val_loss:.4f} | byte loss {per_byte_loss:.4f} | ds {time.time() - t_start:.1f}s')            
                 
             if step > 0 and (step % 5000 == 0 or eval_checkpoint_exit):
                 # optionally write model checkpoints
@@ -428,7 +440,6 @@ def main():
         x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)            
-        loss = loss 
         loss_accum.append(loss.detach())
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -447,11 +458,11 @@ def main():
             avg_loss = sum(loss_accum) / len(loss_accum)
             loss_accum.clear()
             if ds > config.max_runtime_seconds:
-                print('exiting due to time limit')
+                logger.log('exiting due to time limit')
                 eval_checkpoint_exit = True                
 
             per_byte_loss = avg_loss / bytes_per_token
-            log_msg(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
+            logger.log(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
             
 
 if __name__ == "__main__":
