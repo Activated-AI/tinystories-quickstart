@@ -15,23 +15,23 @@ from tqdm import tqdm
 @dataclass
 class GPTConfig:
     block_size: int = 512 # max sequence length     
-    n_layer: int = 14 # number of layers    
+    n_layer: int = 12 # number of layers    
     n_head: int = 16 # number of heads       
     n_embd: int = 512 # embedding dimension 
-    feed_forward_factor: float = 2.5  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
+    feed_forward_factor: float = 1.5  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = 'restart_good_3hr_search'
+    expt_name: str = 'diego_is_12m_man'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
-    min_lr: float = 1e-4
+    min_lr: float = 2e-4
     beta_1: float = 0.9
     beta_2: float = 0.99    
     warmup_steps:int = 50
-    max_steps: int = int(20000 * 3)
-    max_runtime_seconds: int = int(3600 * 3)
+    max_steps: int = 4300
+    max_runtime_seconds: int = 720
 
     weight_decay: float = 0.12
 
