@@ -348,6 +348,14 @@ class ExponentiallyWeightedMean:
         
         return self.mean
 
+def load_model_from_checkpoint(checkpoint_path):
+    def remove_orig_mod_prefix(state_dict):
+        return {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    checkpoint = torch.load(checkpoint_path)
+    model = GPT(checkpoint['config'])
+    model.load_state_dict(remove_orig_mod_prefix(checkpoint['model']))
+    model.to('cuda')
+    return model
 
 
 def main():
