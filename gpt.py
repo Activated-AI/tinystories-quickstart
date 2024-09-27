@@ -16,13 +16,13 @@ from tqdm import tqdm
 class GPTConfig:
     block_size: int = 512 # max sequence length     
     n_layer: int = 12 # number of layers    
-    n_head: int = 16 # number of heads       
-    n_embd: int = 512 # embedding dimension 
-    feed_forward_factor: float = 1.5  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
+    n_head: int = 12 # number of heads       
+    n_embd: int = 384 # embedding dimension 
+    feed_forward_factor: float = 1.8  # how much bigger the MLP blocks are than the model n_embd.  Conventionally 4.
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = 'diego_is_12m_man'
+    expt_name: str = '384_dims_is_all_u_need'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
@@ -30,7 +30,7 @@ class GPTConfig:
     beta_1: float = 0.9
     beta_2: float = 0.99    
     warmup_steps:int = 50
-    max_steps: int = 4300
+    max_steps: int = 12000
     max_runtime_seconds: int = 720
 
     weight_decay: float = 0.12
@@ -97,6 +97,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         ff_exp = int(config.feed_forward_factor * config.n_embd)
+        ff_exp -= ff_exp % 64
         assert ff_exp % 64 == 0
         self.c_fc    = nn.Linear(config.n_embd, ff_exp)
         self.gelu    = nn.GELU(approximate='tanh')
@@ -325,6 +326,29 @@ def preprocess_tokens_from_huggingface(dataset_dir):
         else:
             logger.log(f'skipping token preprocessing for {split} : using cache {fn}')
 
+class ExponentiallyWeightedMean:
+    def __init__(self, alpha=0.1, skip_first=False):
+        self.alpha = alpha  # Decay rate
+        self.mean = None  # The weighted mean
+        self.skip_first = skip_first  # Whether to skip the first value
+        self.first_value_skipped = False  # Flag to track if the first value was skipped
+    
+    def update(self, new_value):
+        # If we are skipping the first value, ensure we track and skip it
+        if self.skip_first and not self.first_value_skipped:
+            self.first_value_skipped = True
+            return None  # Skip the first value
+        
+        if self.mean is None:
+            # If mean is not set, initialize it with the first value
+            self.mean = new_value
+        else:
+            # Update the mean using exponential decay
+            self.mean = self.alpha * new_value + (1 - self.alpha) * self.mean
+        
+        return self.mean
+
+
 
 def main():
     assert torch.cuda.is_available()
@@ -357,19 +381,23 @@ def main():
         logger.log('using torch.compile')
         model = torch.compile(model)
             
-    # TODO: replace this with torch LR built in scheduler.
-    def get_lr(it):
-        # 1) linear warmup for warmup_iters steps
+    
+    def get_lr(it, estimated_steps_in_time_limit=None):
+        lowest_maximum_steps = min(config.max_steps, estimated_steps_in_time_limit) if estimated_steps_in_time_limit is not None else config.max_steps
+
+        # 1) linear warmup for warmup_steps steps
         if it < config.warmup_steps:
-            return config.max_lr * (it+1) / config.warmup_steps
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > config.max_steps:
+            return config.max_lr * (it + 1) / config.warmup_steps
+        # 2) if it >= lowest_maximum_steps, return min learning rate
+        if it >= lowest_maximum_steps:
             return config.min_lr
         # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - config.warmup_steps) / (config.max_steps - config.warmup_steps)
+        decay_ratio = (it - config.warmup_steps) / (lowest_maximum_steps - config.warmup_steps)
         assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        decay_ratio = min(max(decay_ratio, 0), 1)  # Ensure decay_ratio is within [0, 1]
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff starts at 1 and goes to 0
         return config.min_lr + coeff * (config.max_lr - config.min_lr)
+
 
     optimizer = model.configure_optimizers(weight_decay=config.weight_decay, learning_rate=config.max_lr, 
                                            device_type=device_type, beta1=config.beta_1, beta2=config.beta_2)
@@ -383,6 +411,10 @@ def main():
     t_start = time.time()
     eval_checkpoint_exit = False
     loss_accum = []
+
+    # Example usage:
+    mean_dt_ewma = ExponentiallyWeightedMean(alpha=0.01, skip_first=True)
+    estimated_steps_in_time_limit = None
 
 
     for step in range(config.max_steps):
@@ -444,7 +476,7 @@ def main():
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # determine and set the learning rate for this iteration
-        lr = get_lr(step)
+        lr = get_lr(step, estimated_steps_in_time_limit=estimated_steps_in_time_limit)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         optimizer.step()        
@@ -459,7 +491,19 @@ def main():
             loss_accum.clear()
             if ds > config.max_runtime_seconds:
                 logger.log('exiting due to time limit')
-                eval_checkpoint_exit = True                
+                eval_checkpoint_exit = True     
+
+            mean_dt_ewma.update(dt)
+            if mean_dt_ewma.mean is not None:
+                remaining_steps = config.max_steps - step
+                remaining_time = config.max_runtime_seconds - ds
+                # let some time for the last step to finish
+                if (remaining_time < 0) and (remaining_time > -10):
+                    remaining_time = 0
+                assert remaining_time >= 0
+                remaining_steps_in_time_limit = int(remaining_time / mean_dt_ewma.mean)
+                estimated_steps_in_time_limit = step + remaining_steps_in_time_limit
+
 
             per_byte_loss = avg_loss / bytes_per_token
             logger.log(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
