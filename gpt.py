@@ -5,6 +5,7 @@ import time
 import inspect
 from dataclasses import dataclass, fields
 import torch
+import torch.serialization
 import torch.nn as nn
 from torch.nn import functional as F
 import datasets
@@ -22,7 +23,7 @@ class GPTConfig:
     vocab_size: int = 8192
     
     data_dir: str = 'dataset'    
-    expt_name: str = '384_dims_is_all_u_need'
+    expt_name: str = 'clean_baseline'
 
     batch_size: int = 128    
     max_lr: float = 2e-3
@@ -50,7 +51,10 @@ class Logger():
         self.log_dir = f'logs/{expt_name}{"_smoke" if smoke_test else ""}'
         os.makedirs(self.log_dir, exist_ok=True) 
         self.log_file = f'{self.log_dir}/log.txt'
+        self.generations_file = f'{self.log_dir}/generations.txt'
         with open(self.log_file, "w") as f:
+            f.write("")
+        with open(self.generations_file, "w") as f:
             f.write("")
 
     def log(self, msg):
@@ -58,7 +62,18 @@ class Logger():
         with open(self.log_file, "a") as f:
             f.write(f"{msg}\n")
 
+    def log_generation_sample(self, step, prompt, sample_idx, text, preview_chars=80):
+        preview = text[:preview_chars].replace('\n', ' ')
+        if len(text) > preview_chars:
+            preview += '...'
+        self.log(f'generation step {step} sample {sample_idx} prompt "{prompt[:40]}": {preview}')
+        with open(self.generations_file, "a") as f:
+            f.write(f"step {step} | prompt: {prompt}\n")
+            f.write(f"sample {sample_idx}: {text}\n")
+            f.write("-" * 40 + "\n")
+
 config = GPTConfig()
+torch.serialization.add_safe_globals([GPTConfig])
 logger = Logger(os.path.join(config.expt_name), config.smoke_test) # open for writing to clear the file        
 logger.log(str(config))
 
@@ -75,6 +90,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -227,7 +243,6 @@ class DataLoaderLite:
         if self.shuffle:
             start = time.time()
             self.shuffle_tokens()
-            logger.log(f"shuffled {self.tokens.shape[0]} tokens in {time.time() - start:.1f}s")
 
     def shuffle_tokens(self, DOCUMENT_END: int = 0):
         """Shuffle documents in a flat token tensor while keeping each document contiguous."""
@@ -263,7 +278,7 @@ class DataLoaderLite:
         return x, y
 
 
-def generate(model, enc, prompt, max_length, num_return_sequences):
+def generate(model, enc, prompt, max_length, num_return_sequences, logger_instance=None, log_to_logger=True):
     model.eval() 
     
     eos_id = enc.get_vocab()['[EOS]']
@@ -292,7 +307,10 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
             xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
             # append to the sequence
             xgen = torch.cat((xgen, xcol), dim=1)
-    # logger.log the generated text
+    # collect the generated text
+    outputs = []
+    if logger_instance is None:
+        logger_instance = logger
     for i in range(num_return_sequences):
         # look for EOS here to truncate.
         first_eos = (xgen[i] == eos_id).nonzero()
@@ -302,9 +320,26 @@ def generate(model, enc, prompt, max_length, num_return_sequences):
             this_end = max_length
         tokens = xgen[i, :this_end].tolist()
         decoded = enc.decode(tokens)
-        logger.log(f"sample {i}: {decoded}")
+        outputs.append(decoded)
+        if log_to_logger and logger_instance is not None:
+            logger_instance.log(f"sample {i}: {decoded}")
 
     model.train()
+    return outputs
+
+
+def estimate_bytes_per_token(enc, token_tensor, sample_token_count=100_000):
+    """Estimate mean UTF-8 bytes per token by decoding a token sample."""
+    total_tokens = token_tensor.numel()
+    if total_tokens == 0:
+        return 1.0
+    sample_token_count = min(sample_token_count, total_tokens)
+    sample = token_tensor[:sample_token_count].tolist()
+    decoded = enc.decode(sample)
+    byte_count = len(decoded.encode('utf-8'))
+    if sample_token_count == 0:
+        return 1.0
+    return byte_count / sample_token_count
 
 
 def preprocess_tokens_from_huggingface(dataset_dir):
@@ -319,7 +354,7 @@ def preprocess_tokens_from_huggingface(dataset_dir):
         os.makedirs(dataset_dir, exist_ok=True)
         fn = f'{dataset_dir}/{split}.pt'
         if not os.path.exists(fn):         
-            logger.log('downloading and processing', split)
+            logger.log(f'downloading and processing {split}')
             ds = datasets.load_dataset('activated-ai/tiny-stories-8k-tokens', split=split)
             val_tensor = flatten_tensorize_dataset_split(ds['tokens'])
             torch.save(val_tensor, fn)
@@ -372,8 +407,8 @@ def main():
     preprocess_tokens_from_huggingface(config.data_dir)
 
     val_loader = DataLoaderLite(data_dir=config.data_dir, B=config.batch_size, T=config.block_size, split="val", shuffle=False)
-    bytes_in_val_text = 19190318  # compute this on data load by using tokenizer on say, first 100k tokens in validation data.
-    bytes_per_token = bytes_in_val_text / val_loader.tokens.shape[0]
+    bytes_per_token = estimate_bytes_per_token(enc, val_loader.tokens)
+    logger.log(f'estimated bytes/token: {bytes_per_token:.4f}')
     if not config.smoke_test:
         train_loader = DataLoaderLite(data_dir=config.data_dir , B=config.batch_size, T=config.block_size, split="train", shuffle=config.need_epoch_reshuffle)        
     else:    
@@ -423,6 +458,14 @@ def main():
     # Example usage:
     mean_dt_ewma = ExponentiallyWeightedMean(alpha=0.01, skip_first=True)
     estimated_steps_in_time_limit = None
+    eval_interval = 250
+    generation_interval = eval_interval * 10
+    generation_prompts = [
+        "Lily went to the park and saw a friendly dog.",
+        "Evan built a tiny robot that loved to tell stories."
+    ]
+    generation_max_length = min(256, config.block_size)
+    generation_return_sequences = 2
 
 
     for step in range(config.max_steps):
@@ -430,7 +473,7 @@ def main():
         eval_checkpoint_exit = (step == config.max_steps - 1) or eval_checkpoint_exit
 
         # once in a while evaluate our validation loss
-        if (step % 250 == 0 and step > 0) or eval_checkpoint_exit:
+        if (step % eval_interval == 0 and step > 0) or eval_checkpoint_exit:
             if config.smoke_test:
                 logger.log('exiting due to smoke test')
                 eval_checkpoint_exit = True
@@ -448,10 +491,26 @@ def main():
                     loss = loss / val_loss_steps
                     val_loss_accum += loss.detach()
 
-            val_loss = val_loss_accum.item()
-            per_byte_loss = val_loss / bytes_per_token
+            val_loss_per_token = val_loss_accum.item()
+            per_byte_loss = val_loss_per_token / bytes_per_token
             
-            logger.log(f'step {step} | val loss {val_loss:.4f} | byte loss {per_byte_loss:.4f} | ds {time.time() - t_start:.1f}s')            
+            logger.log(f'step {step} | val loss/token {val_loss_per_token:.4f} | byte loss {per_byte_loss:.4f} | ds {time.time() - t_start:.1f}s')            
+
+            should_sample_generation = (step % generation_interval == 0 and step > 0)
+            if should_sample_generation:
+                for prompt_idx, prompt in enumerate(generation_prompts):
+                    samples = generate(
+                        model,
+                        enc,
+                        prompt,
+                        generation_max_length,
+                        generation_return_sequences,
+                        logger_instance=logger,
+                        log_to_logger=False,
+                    )
+                    for sample_idx, text in enumerate(samples):
+                        global_sample_idx = prompt_idx * generation_return_sequences + sample_idx
+                        logger.log_generation_sample(step, prompt, global_sample_idx, text)
                 
             if step > 0 and (step % 5000 == 0 or eval_checkpoint_exit):
                 # optionally write model checkpoints
@@ -493,8 +552,8 @@ def main():
             t1 = time.time()
             dt = t1 - t0 
             ds = t1 - t_start
-            tokens_processed = train_loader.B * train_loader.T
-            tokens_per_sec = tokens_processed / dt
+            tokens_per_step = train_loader.B * train_loader.T
+            tokens_per_sec = tokens_per_step / dt
             avg_loss = sum(loss_accum) / len(loss_accum)
             loss_accum.clear()
             if ds > config.max_runtime_seconds:
@@ -513,9 +572,25 @@ def main():
                 estimated_steps_in_time_limit = step + remaining_steps_in_time_limit
 
 
-            per_byte_loss = avg_loss / bytes_per_token
-            logger.log(f'step {step:5d} | loss {avg_loss:.6f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
+            loss_per_token = avg_loss.item()
+            loss_per_batch = loss_per_token * tokens_per_step
+            per_byte_loss = loss_per_token / bytes_per_token
+            logger.log(f'step {step:5d} | loss/token {loss_per_token:.6f} | loss/batch {loss_per_batch:.4f} | byte loss {per_byte_loss:.4f} | lr {lr:.4e} | norm {norm:.4f} | dt {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | ds {ds:.1f}s')
             
+
+    final_checkpoint_path = os.path.join(log_dir, "model_final.pt")
+    final_checkpoint = {
+        'model': model.state_dict(),
+        'config': model.config,
+        'step': step,
+    }
+    try:
+        final_checkpoint['optimizer'] = optimizer.state_dict()
+    except Exception as exc:
+        logger.log(f'warning: failed to serialize optimizer state: {exc}')
+    torch.save(final_checkpoint, final_checkpoint_path)
+    logger.log(f'saved final checkpoint to {final_checkpoint_path}')
 
 if __name__ == "__main__":
     main()
+
